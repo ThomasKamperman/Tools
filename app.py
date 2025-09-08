@@ -1,10 +1,15 @@
 # app.py
+# - Bug fixes (clipboard, placeholders, duplicates)
+# - Pagination for article results
+# - Export workspace to ZIP (JSON + FASTA)
+# - Better error handling & UX improvements
+
 import os
 import io
 import json
-import math
+import zipfile
 import re
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import List, Dict, Optional
 
 import requests
@@ -15,30 +20,34 @@ import streamlit as st
 from xml.etree import ElementTree as ET
 import streamlit.components.v1 as components
 
-# -------------------------
-# Basic config
-# -------------------------
-st.set_page_config(page_title="Bioengineer Research Assistant", layout="wide")
-st.title("Researsch tool")
+st.set_page_config(page_title="Research Tool", layout="wide")
+st.title("Research Tool")
 
+# -------------------------
+# Constants / endpoints
+# -------------------------
 BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 RCSB_PDB_URL = "https://files.rcsb.org/download/"
 
 # -------------------------
-# Session workspace
+# Session scaffolding (dedup keys)
 # -------------------------
 if "articles" not in st.session_state:
-    st.session_state.articles = []  # list of dicts
+    st.session_state.articles = []         # list of dicts
+    st.session_state._article_ids = set()
 if "sequences" not in st.session_state:
     st.session_state.sequences = []
+    st.session_state._sequence_ids = set()
 if "molecules" not in st.session_state:
     st.session_state.molecules = []
+    st.session_state._molecule_ids = set()
 if "pdbs" not in st.session_state:
     st.session_state.pdbs = []
+    st.session_state._pdb_ids = set()
 
 # -------------------------
-# Utility helpers
+# Utilities
 # -------------------------
 def safe_findtext(elem: ET.Element, path: str) -> Optional[str]:
     t = elem.findtext(path)
@@ -54,7 +63,7 @@ def ncbi_request(path: str, params: dict, timeout: int = 20) -> requests.Respons
     return resp
 
 # -------------------------
-# CACHED API calls
+# Caching wrappers
 # -------------------------
 @st.cache_data(show_spinner=False)
 def search_ids(query: str, db: str = "pubmed", max_results: int = 10) -> List[str]:
@@ -67,7 +76,7 @@ def search_ids(query: str, db: str = "pubmed", max_results: int = 10) -> List[st
         return []
 
 @st.cache_data(show_spinner=False)
-def fetch_pubmed(pmid: str, abstract_max_len: int = 500) -> Dict:
+def fetch_pubmed(pmid: str, abstract_max_len: int = 800) -> Dict:
     try:
         params = {"db": "pubmed", "id": pmid, "retmode": "xml"}
         r = ncbi_request("efetch.fcgi", params)
@@ -77,7 +86,6 @@ def fetch_pubmed(pmid: str, abstract_max_len: int = 500) -> Dict:
             return {"id": pmid, "error": "Not found"}
         title = safe_findtext(art, ".//ArticleTitle") or "No title"
         year = safe_findtext(art, ".//JournalIssue/PubDate/Year")
-        # sometimes MedlineDate exists
         if year is None:
             med = safe_findtext(art, ".//JournalIssue/PubDate/MedlineDate")
             if med:
@@ -85,25 +93,20 @@ def fetch_pubmed(pmid: str, abstract_max_len: int = 500) -> Dict:
         journal = safe_findtext(art, ".//Journal/Title")
         abstract_parts = [t.text for t in art.findall(".//AbstractText") if t.text]
         abstract = " ".join(abstract_parts) if abstract_parts else "No abstract"
-        if len(abstract) > abstract_max_len:
-            preview = abstract[:abstract_max_len] + "..."
-        else:
-            preview = abstract
+        preview = abstract if len(abstract) <= abstract_max_len else abstract[:abstract_max_len] + "..."
         return {"db":"pubmed","id":pmid,"title":title,"year":year,"journal":journal,"abstract":abstract,"preview":preview}
     except Exception as e:
         return {"id": pmid, "error": str(e)}
 
 @st.cache_data(show_spinner=False)
-def fetch_pmc(pmcid: str, full_article: bool = False, abstract_max_len: int = 500) -> Dict:
+def fetch_pmc(pmcid: str, full_article: bool = False, abstract_max_len: int = 800) -> Dict:
     try:
         params = {"db": "pmc", "id": pmcid, "retmode": "xml"}
         r = ncbi_request("efetch.fcgi", params)
         root = ET.fromstring(r.content)
         title = safe_findtext(root, ".//article-title") or safe_findtext(root, ".//title") or "No title"
         paragraphs = []
-        # gather paragraphs in body
         for p in root.findall(".//body//p"):
-            # combine text + tails
             text_chunks = []
             if p.text:
                 text_chunks.append(p.text)
@@ -115,13 +118,12 @@ def fetch_pmc(pmcid: str, full_article: bool = False, abstract_max_len: int = 50
                 paragraphs.append(paragraph)
         full_text = "\n\n".join(paragraphs).strip()
         if not full_text:
-            # fallback
             sec_pars = [sec.text for sec in root.findall(".//sec//p") if sec.text]
             full_text = "\n\n".join(sec_pars)
         if full_article:
             return {"db":"pmc","id":pmcid,"title":title,"full_text":full_text or "Full text not available"}
         else:
-            preview = (full_text[:abstract_max_len] + "...") if full_text and len(full_text) > abstract_max_len else (full_text or "No preview available")
+            preview = (full_text[:abstract_max_len] + "...") if full_text and len(full_text) > abstract_max_len else (full_text or "No preview")
             return {"db":"pmc","id":pmcid,"title":title,"abstract":preview,"full_text":None}
     except Exception as e:
         return {"id": pmcid, "error": str(e)}
@@ -181,7 +183,6 @@ def pubchem_get_3d_sdf(cid: int) -> Optional[str]:
 @st.cache_data(show_spinner=False)
 def pubchem_get_properties(cid: int) -> Dict:
     try:
-        # request common properties
         url = f"{PUBCHEM_BASE}/compound/cid/{cid}/property/MolecularFormula,MolecularWeight,CanonicalSMILES/JSON"
         r = requests.get(url, timeout=10)
         r.raise_for_status()
@@ -193,7 +194,7 @@ def pubchem_get_properties(cid: int) -> Dict:
         return {}
 
 # -------------------------
-# PDB fetcher and ligand parser
+# PDB helpers
 # -------------------------
 @st.cache_data(show_spinner=False)
 def fetch_pdb_file(pdb_id: str) -> Optional[str]:
@@ -210,19 +211,23 @@ def fetch_pdb_file(pdb_id: str) -> Optional[str]:
 def extract_pdb_ligands(pdb_text: str) -> List[str]:
     ligands = set()
     for line in pdb_text.splitlines():
-        if line.startswith("HET   ") or line.startswith("HETATM"):
-            # HET lines: format uses residue name at columns 17-20 historically
+        if line.startswith("HET   "):
+            # crude parse: residue name typically at cols 7-10, but easiest via split
             parts = line.split()
-            # crude attempt: residue name likely at position 3 or 4
             if len(parts) >= 4:
                 lig_name = parts[3]
-                # filter common solvent names
+                if lig_name not in ("HOH", "WAT"):
+                    ligands.add(lig_name)
+        elif line.startswith("HETATM"):
+            parts = line.split()
+            if len(parts) >= 4:
+                lig_name = parts[3]
                 if lig_name not in ("HOH", "WAT"):
                     ligands.add(lig_name)
     return sorted(ligands)
 
 # -------------------------
-# Visualization helpers
+# Visualizations
 # -------------------------
 def plot_aa_composition(fasta: str):
     seq = "".join([line.strip() for line in fasta.splitlines() if not line.startswith(">")])
@@ -239,7 +244,6 @@ def plot_aa_composition(fasta: str):
     st.pyplot(fig)
 
 def kyte_doolittle(seq: str, window: int = 9):
-    # Kyte-Doolittle hydrophobicity scale
     kd = {
         "I": 4.5, "V": 4.2, "L": 3.8, "F": 2.8, "C": 2.5,
         "M": 1.9, "A": 1.8, "G": -0.4, "T": -0.7, "S": -0.8,
@@ -282,65 +286,60 @@ def plot_gc_and_length(fasta: str):
     col2.metric("Sequence length", f"{length:,}")
 
 # -------------------------
-# 3D viewer HTML builders
+# 3D HTML builders (3Dmol.js)
 # -------------------------
 def make_3dmol_html_from_sdf(sdf_text: str, width: int = 700, height: int = 450):
     import json
     sdf_js = json.dumps(sdf_text)
-    # double braces for .format
-    html = """
-<div id="viewer" style="width:{w}px; height:{h}px; position: relative;"></div>
+    html = f"""
+<div id="viewer" style="width:{width}px; height:{height}px; position: relative;"></div>
 <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
 <script>
   const viewer = $3Dmol.createViewer("viewer", {{backgroundColor: "white"}});
-  const sdf = {sdf};
+  const sdf = {sdf_js};
   viewer.addModel(sdf, "sdf");
   viewer.setStyle({{}}, {{stick:{{}}}});
   viewer.zoomTo();
   viewer.render();
 </script>
-""".format(w=width, h=height, sdf=sdf_js)
+"""
     return html
 
 def make_3dmol_html_from_pdb(pdb_text: str, width: int = 800, height: int = 500):
     import json
     pdb_js = json.dumps(pdb_text)
-    html = """
-<div id="viewer" style="width:{w}px; height:{h}px; position: relative;"></div>
+    html = f"""
+<div id="viewer" style="width:{width}px; height:{height}px; position: relative;"></div>
 <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
 <script>
   const viewer = $3Dmol.createViewer("viewer", {{backgroundColor: "white"}});
-  const pdb = {pdb};
+  const pdb = {pdb_js};
   viewer.addModel(pdb, "pdb");
   viewer.setStyle({{}}, {{cartoon:{{color: 'spectrum'}}}});
   viewer.zoomTo();
   viewer.render();
 </script>
-""".format(w=width, h=height, pdb=pdb_js)
+"""
     return html
 
 # -------------------------
-# Text highlighting utility
+# Highlight helper
 # -------------------------
 def highlight_terms(text: str, terms: List[str]) -> str:
     if not text:
         return ""
     out = text
-    # sort terms by length to avoid partial overlapping replacements
     terms_sorted = sorted(set([t for t in terms if t.strip()]), key=lambda x: -len(x))
     for t in terms_sorted:
-        # case-insensitive replace with <mark>
         pattern = re.compile(re.escape(t), flags=re.IGNORECASE)
         out = pattern.sub(lambda m: f"<mark>{m.group(0)}</mark>", out)
-    # escape newlines to <br>
     out = out.replace("\n", "<br>")
     return out
 
 # -------------------------
-# Simple co-occurrence network from abstracts
+# Simple co-occurrence network
 # -------------------------
 def build_cooccurrence_graph(docs: List[str], top_n_terms: int = 30):
-    # naive term extraction: split by non-alphanum and lowercase, count terms
     words = []
     for d in docs:
         if not d: continue
@@ -374,7 +373,27 @@ def plot_network(G):
     st.pyplot(fig)
 
 # -------------------------
-# Sidebar controls: top-level organization
+# Clipboard helper (JS)
+# -------------------------
+def js_copy_button(text: str, key: str = "copy"):
+    # returns a component with a copy button that copies `text` to clipboard
+    escaped = json.dumps(text)  # safe JS string
+    html = f"""
+<button id="btn_{key}">Copy</button>
+<script>
+const txt = {escaped};
+document.getElementById("btn_{key}").addEventListener("click", async () => {{
+  await navigator.clipboard.writeText(txt);
+  const prev = document.getElementById("btn_{key}");
+  prev.innerText = "Copied!";
+  setTimeout(()=> prev.innerText="Copy", 1500);
+}});
+</script>
+"""
+    components.html(html, height=40)
+
+# -------------------------
+# Sidebar controls
 # -------------------------
 st.sidebar.title("Controls")
 st.sidebar.text_input("NCBI API key (optional)", key="ncbi_api_key")
@@ -382,69 +401,73 @@ st.sidebar.text_input("NCBI API key (optional)", key="ncbi_api_key")
 section = st.sidebar.radio("Section", ["Articles", "Sequences", "Molecules", "Protein 3D", "Workspace", "Network"])
 
 # -------------------------
-# ARTICLES tab
+# Articles tab (with pagination)
 # -------------------------
 if section == "Articles":
     st.sidebar.header("Article search")
-    query = st.sidebar.text_input("Query (PubMed/PMC)", value="pancreas organ on a chip")
-    max_results = st.sidebar.slider("Max results per DB", 1, 20, 5)
+    query = st.sidebar.text_input("Query", value="pancreas organ on a chip")
+    max_results = st.sidebar.number_input("Max results per DB", min_value=1, max_value=20, value=6, step=1)
     full_article_toggle = st.sidebar.checkbox("Fetch full text from PMC (if available)", value=False)
     year_from, year_to = st.sidebar.slider("Year range", 1990, 2026, (2000, 2025))
     organ_terms = st.sidebar.text_input("Highlight keywords (comma-separated)", value="pancreas, insulin, islet")
     highlight_list = [t.strip() for t in organ_terms.split(",") if t.strip()]
+    # pagination state
+    if "articles_page" not in st.session_state:
+        st.session_state.articles_page = 0
+    per_page = st.sidebar.number_input("Results per page (UI)", min_value=1, max_value=10, value=3)
     if st.sidebar.button("Search"):
+        st.session_state.articles_page = 0
         with st.spinner("Searching PubMed and PMC..."):
             pmids = search_ids(query, db="pubmed", max_results=max_results)
             pmcs = search_ids(query, db="pmc", max_results=max_results)
             results_display = []
-            # fetch pubmed results
+            # PubMed
             for pmid in pmids:
-                res = fetch_pubmed(pmid, abstract_max_len=1500)
-                # filter by year range if possible
+                res = fetch_pubmed(pmid, abstract_max_len=2000)
+                # filter by year
                 try:
                     y = int(res.get("year")) if res.get("year") else None
                 except:
                     y = None
                 if y is not None and not (year_from <= y <= year_to):
                     continue
+                res["db"] = "pubmed"
                 results_display.append(res)
-                st.session_state.articles.append(res)
-            # fetch pmc results
+            # PMC
             for pid in pmcs:
-                res = fetch_pmc(pid, full_article=full_article_toggle, abstract_max_len=1500)
+                res = fetch_pmc(pid, full_article=full_article_toggle, abstract_max_len=2000)
+                res["db"] = "pmc"
                 results_display.append(res)
-                st.session_state.articles.append(res)
-        # show literature dashboard
-        st.subheader("Literature dashboard")
-        years = [int(r.get("year")) for r in st.session_state.articles if r.get("year") and r.get("year").isdigit()]
-        if years:
-            df_year = pd.Series(years).value_counts().sort_index()
-            fig, ax = plt.subplots(figsize=(8,3))
-            df_year.plot(kind="bar", ax=ax)
-            ax.set_xlabel("Year")
-            ax.set_ylabel("Count")
-            st.pyplot(fig)
-        # top journals
-        journals = [r.get("journal") for r in st.session_state.articles if r.get("journal")]
-        if journals:
-            topj = pd.Series(journals).value_counts().head(10)
-            st.markdown("**Top journals (session)**")
-            st.table(topj.reset_index().rename(columns={"index":"Journal", 0:"Count"}))
-        # display results nicely
-        st.subheader("Search results")
-        for r in results_display:
+            st.session_state._last_search_results = results_display
+    # show results from last search
+    results_display = st.session_state.get("_last_search_results", [])
+    total = len(results_display)
+    if total == 0:
+        st.info("No results yet — run a search.")
+    else:
+        page = st.session_state.articles_page
+        start = page * per_page
+        end = min(total, start + per_page)
+        st.markdown(f"Showing results {start+1} — {end} of {total}")
+        for r in results_display[start:end]:
             title = r.get("title") or r.get("id")
             year = r.get("year") or ""
             journal = r.get("journal") or ""
-            with st.expander(f"{title}  {f'({year})' if year else ''}", expanded=False):
-                st.markdown(f"**Journal:** {journal}")
-                # links
-                if r.get("db") == "pmc" or str(r.get("id")).lower().startswith("pmc"):
-                    pmc_link = f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{r.get('id')}" if not str(r.get("id")).lower().startswith("pmc") else f"https://www.ncbi.nlm.nih.gov/pmc/articles/{r.get('id')}"
-                    st.markdown(f"[PMC link]({pmc_link})")
-                if r.get("db") == "pubmed" or r.get("id"):
-                    st.markdown(f"[PubMed link](https://pubmed.ncbi.nlm.nih.gov/{r.get('id')})")
-                # show abstract or full text
+            with st.expander(f"{title} {f'({year})' if year else ''}", expanded=False):
+                if journal:
+                    st.markdown(f"**Journal:** {journal}")
+                if r.get("db") == "pmc":
+                    # generate PMC link
+                    pid = r.get("id")
+                    # fix id formatting: PMC id sometimes returned without 'PMC' prefix
+                    if str(pid).lower().startswith("pmc"):
+                        url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pid}"
+                    else:
+                        url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pid}"
+                    st.markdown(f"[Open in PMC]({url})")
+                if r.get("db") == "pubmed":
+                    st.markdown(f"[Open in PubMed](https://pubmed.ncbi.nlm.nih.gov/{r.get('id')})")
+                # show text
                 if r.get("full_text"):
                     html = highlight_terms(r.get("full_text"), highlight_list)
                     st.markdown("**Full text (PMC)**")
@@ -452,7 +475,7 @@ if section == "Articles":
                     st.download_button("Download full text", data=r.get("full_text",""), file_name=f"{r.get('id')}_fulltext.txt")
                 elif r.get("abstract"):
                     html = highlight_terms(r.get("abstract"), highlight_list)
-                    st.markdown("**Abstract / preview**")
+                    st.markdown("**Abstract**")
                     st.markdown(html, unsafe_allow_html=True)
                 elif r.get("preview"):
                     html = highlight_terms(r.get("preview"), highlight_list)
@@ -460,55 +483,70 @@ if section == "Articles":
                     st.markdown(html, unsafe_allow_html=True)
                 else:
                     st.write("No text available")
-                # tag or save
+                # actions: save, export, copy citation
                 cols = st.columns([1,1,1,3])
-                if cols[0].button("Save to workspace", key=f"save_{r.get('id')}"):
-                    st.session_state.articles.append(r)
-                    st.success("Saved to workspace")
-                if cols[1].button("Export as JSON", key=f"export_{r.get('id')}"):
+                # Save to workspace (deduped)
+                if cols[0].button("Save", key=f"save_article_{r.get('db')}_{r.get('id')}"):
+                    uid = f"{r.get('db')}:{r.get('id')}"
+                    if uid not in st.session_state._article_ids:
+                        st.session_state.articles.append(r)
+                        st.session_state._article_ids.add(uid)
+                        st.success("Saved")
+                    else:
+                        st.info("Already saved")
+                # Export JSON
+                if cols[1].button("Export JSON", key=f"export_article_{r.get('db')}_{r.get('id')}"):
                     st.download_button("Download JSON", data=json.dumps(r, indent=2).encode("utf-8"), file_name=f"{r.get('id')}.json", mime="application/json")
-                if cols[2].button("Copy citation (simple)", key=f"cite_{r.get('id')}"):
+                # Copy citation via JS
+                if cols[2].button("Copy citation", key=f"cite_article_{r.get('db')}_{r.get('id')}"):
                     citation = f"{r.get('title')} ({r.get('year')}) {r.get('journal')}"
-                    st.clipboard_set(citation)
-                    st.info("Citation copied to clipboard")
+                    js_copy_button(citation, key=f"cite_{r.get('id')}")
+        # pagination controls
+        page_cols = st.columns([1,1,6])
+        if page_cols[0].button("Previous") and st.session_state.articles_page > 0:
+            st.session_state.articles_page -= 1
+        if page_cols[1].button("Next") and (st.session_state.articles_page+1)*per_page < total:
+            st.session_state.articles_page += 1
 
 # -------------------------
-# SEQUENCES tab
+# Sequences tab
 # -------------------------
 elif section == "Sequences":
     st.sidebar.header("Sequence fetch & analysis")
-    seq_id_input = st.sidebar.text_input("Sequence ID(s) (comma-separated, e.g., NP_000000 or accession)", value="")
+    seq_id_input = st.sidebar.text_input("Sequence ID(s) (comma-separated)", value="")
     seq_db = st.sidebar.selectbox("Database", ["protein","nucleotide"])
-    motif = st.sidebar.text_input("Search motif (optional, regex)")
+    motif = st.sidebar.text_input("Search motif (regex, optional)", value="")
     hyd_window = st.sidebar.slider("Hydrophobicity window", 5, 21, 9, step=2)
     if st.sidebar.button("Fetch sequences"):
         ids = [i.strip() for i in seq_id_input.split(",") if i.strip()]
+        if not ids:
+            st.sidebar.error("Provide at least one ID")
         for sid in ids:
             rec = fetch_sequence(sid, db=seq_db)
             if rec.get("error"):
                 st.error(f"Error fetching {sid}: {rec['error']}")
                 continue
-            st.session_state.sequences.append(rec)
-            st.subheader(f"Sequence: {sid} ({seq_db})")
-            st.code(rec.get("fasta","")[:2000])
+            uid = f"{rec.get('db')}:{rec.get('id')}"
+            if uid not in st.session_state._sequence_ids:
+                st.session_state.sequences.append(rec)
+                st.session_state._sequence_ids.add(uid)
+            # Display
+            st.subheader(f"{rec.get('db').upper()} — {rec.get('id')}")
+            fasta_preview = "\n".join(rec.get("fasta","").splitlines()[:200])
+            st.code(fasta_preview)
             if seq_db == "protein":
-                plot_aa_composition = plot_aa_composition if False else None  # placeholder to avoid lint
-                plot_aa_composition(fasta=rec.get("fasta","")) if True else None
-                st.markdown("Hydrophobicity (Kyte-Doolittle)")
+                plot_aa_composition(rec.get("fasta",""))
+                st.markdown("Hydrophobicity (Kyte–Doolittle)")
                 plot_hydrophobicity(rec.get("fasta",""), window=hyd_window)
-                if motif:
-                    seq = "".join([l for l in rec.get("fasta","").splitlines() if not l.startswith(">")])
-                    matches = [m.span() for m in re.finditer(motif, seq)]
-                    st.write(f"Motif matches (start,end): {matches}")
             else:
                 plot_gc_and_length(rec.get("fasta",""))
-                if motif:
-                    seq = "".join([l for l in rec.get("fasta","").splitlines() if not l.startswith(">")])
-                    matches = [m.span() for m in re.finditer(motif, seq)]
-                    st.write(f"Motif matches (start,end): {matches}")
+            if motif:
+                seq = "".join([l for l in rec.get("fasta","").splitlines() if not l.startswith(">")])
+                matches = [m.span() for m in re.finditer(motif, seq)]
+                st.write(f"Motif matches (start,end): {matches if matches else 'None'}")
 
 # -------------------------
-# MOLECULES tab
+# Molecules tab
 # -------------------------
 elif section == "Molecules":
     st.sidebar.header("PubChem lookup")
@@ -519,24 +557,28 @@ elif section == "Molecules":
             if not cid:
                 st.error("No PubChem CID found")
             else:
-                st.success(f"Found CID {cid}")
                 props = pubchem_get_properties(cid)
                 png = pubchem_get_2d_png_bytes(cid)
                 sdf = pubchem_get_3d_sdf(cid)
                 st.subheader(f"PubChem CID {cid}")
                 if props:
                     st.write("**Properties**")
-                    st.write(props)
+                    st.json(props)
                 if png:
                     st.image(png, caption=f"{mol_query} (CID {cid})")
                 if sdf:
-                    st.markdown("**3D interactive view**")
+                    st.markdown("**3D interactive view (3Dmol.js)**")
                     html = make_3dmol_html_from_sdf(sdf)
-                    components.html(html, height=500, scrolling=False)
-                st.session_state.molecules.append({"query":mol_query,"cid":cid,"props":props})
+                    components.html(html, height=520, scrolling=False)
+                link = f"https://pubchem.ncbi.nlm.nih.gov/compound/{cid}"
+                st.markdown(f"[Open in PubChem]({link})")
+                uid = f"pubchem:{cid}"
+                if uid not in st.session_state._molecule_ids:
+                    st.session_state.molecules.append({"query":mol_query,"cid":cid,"props":props})
+                    st.session_state._molecule_ids.add(uid)
 
 # -------------------------
-# PROTEIN 3D tab
+# Protein 3D tab
 # -------------------------
 elif section == "Protein 3D":
     st.sidebar.header("RCSB PDB viewer")
@@ -550,7 +592,10 @@ elif section == "Protein 3D":
                 if not pdb_text:
                     st.error("Could not fetch PDB")
                 else:
-                    st.session_state.pdbs.append({"pdb_id":pdb_id_input})
+                    uid = f"pdb:{pdb_id_input.lower()}"
+                    if uid not in st.session_state._pdb_ids:
+                        st.session_state.pdbs.append({"pdb_id":pdb_id_input})
+                        st.session_state._pdb_ids.add(uid)
                     st.subheader(f"PDB: {pdb_id_input}")
                     ligs = extract_pdb_ligands(pdb_text)
                     if ligs:
@@ -560,63 +605,81 @@ elif section == "Protein 3D":
                     components.html(html, height=560, scrolling=False)
 
 # -------------------------
-# WORKSPACE tab
+# Workspace tab (export to zip)
 # -------------------------
 elif section == "Workspace":
     st.header("Session workspace")
-    st.markdown("Saved items (articles, sequences, molecules, pdbs) from this session")
+    st.markdown("Saved items during this session")
+    # Articles
     st.subheader("Articles")
     if st.session_state.articles:
         for a in st.session_state.articles:
-            with st.expander(f"{a.get('title') or a.get('id')}"):
-                st.write(a)
+            with st.expander(a.get("title") or a.get("id")):
+                st.write({"id": a.get("id"), "title": a.get("title"), "year": a.get("year"), "journal": a.get("journal")})
     else:
-        st.info("No articles saved in session")
+        st.info("No articles saved")
+    # Sequences
     st.subheader("Sequences")
     if st.session_state.sequences:
-        for s in st.session_state.sequences:
-            st.code(s.get("fasta","")[:1000])
+        table = [{"db": s.get("db"), "id": s.get("id"), "length": len("".join([l for l in s.get("fasta","").splitlines() if not l.startswith(">")]))} for s in st.session_state.sequences]
+        st.table(pd.DataFrame(table))
     else:
-        st.info("No sequences in session")
+        st.info("No sequences saved")
+    # Molecules
     st.subheader("Molecules")
     if st.session_state.molecules:
         st.table(pd.DataFrame(st.session_state.molecules))
     else:
         st.info("No molecules saved")
+    # PDBs
     st.subheader("PDBs")
     if st.session_state.pdbs:
         st.table(pd.DataFrame(st.session_state.pdbs))
     else:
         st.info("No pdbs saved")
+
     st.markdown("---")
-    if st.button("Export entire session JSON"):
-        data = {
-            "articles": st.session_state.articles,
-            "sequences": st.session_state.sequences,
-            "molecules": st.session_state.molecules,
-            "pdbs": st.session_state.pdbs
-        }
-        blob = json.dumps(data, indent=2).encode("utf-8")
-        st.download_button("Download session JSON", data=blob, file_name="session_export.json", mime="application/json")
+    # Export to ZIP
+    if st.button("Export workspace as ZIP"):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("articles.json", json.dumps(st.session_state.articles, indent=2))
+            # sequences as FASTA files
+            for s in st.session_state.sequences:
+                fasta = s.get("fasta","")
+                if fasta:
+                    fname = f"{s.get('db')}_{s.get('id')}.fasta"
+                    z.writestr(fname, fasta)
+            z.writestr("molecules.json", json.dumps(st.session_state.molecules, indent=2))
+            z.writestr("pdbs.json", json.dumps(st.session_state.pdbs, indent=2))
+        buf.seek(0)
+        st.download_button("Download workspace ZIP", data=buf.read(), file_name="workspace_export.zip", mime="application/zip")
+
     if st.button("Clear workspace"):
         st.session_state.articles.clear()
         st.session_state.sequences.clear()
         st.session_state.molecules.clear()
         st.session_state.pdbs.clear()
+        st.session_state._article_ids.clear()
+        st.session_state._sequence_ids.clear()
+        st.session_state._molecule_ids.clear()
+        st.session_state._pdb_ids.clear()
         st.success("Workspace cleared")
 
 # -------------------------
-# NETWORK tab
+# Network tab
 # -------------------------
 elif section == "Network":
-    st.header("Simple co-occurrence network from article abstracts (session)")
-    docs = [a.get("abstract") or a.get("full_text") for a in st.session_state.articles]
-    if not any(docs):
-        st.info("No article texts in session. Save articles first.")
+    st.header("Co-occurrence network from saved article texts")
+    docs = [a.get("abstract") or a.get("full_text") or "" for a in st.session_state.articles]
+    docs = [d for d in docs if d]
+    if not docs:
+        st.info("No article texts saved. Save articles first.")
     else:
-        G = build_cooccurrence_graph(docs, top_n_terms=40)
+        top_n = st.slider("Top terms to include", 10, 100, 40)
+        G = build_cooccurrence_graph(docs, top_n_terms=top_n)
         plot_network(G)
-        if st.button("Export network as JSON"):
+        if st.button("Export network JSON"):
             data = {"nodes":[{"id":n,"size":G.nodes[n].get("size",1)} for n in G.nodes()],
                     "links":[{"source":u,"target":v,"weight":G[u][v]["weight"]} for u,v in G.edges()]}
             st.download_button("Download network", data=json.dumps(data, indent=2).encode("utf-8"), file_name="network.json", mime="application/json")
@@ -625,4 +688,4 @@ elif section == "Network":
 # Footer tips
 # -------------------------
 st.sidebar.markdown("---")
-st.sidebar.markdown("Tips: use the Workspace to collect items you want to export. Use the Network tab to explore term co-occurrence in saved article texts. Deploy to Streamlit Cloud by pushing this repo with `app.py` and `requirements.txt`.")
+st.sidebar.markdown("Tips: use the Workspace to collect items, export as ZIP for sharing. If you plan heavy use, set an NCBI API key in the sidebar (or the NCBI_API_KEY env var).")
