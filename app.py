@@ -69,53 +69,68 @@ def ncbi_request(path: str, params: dict, timeout: int = 20) -> requests.Respons
 def get_api_key():
     """Fetch API key from env or Streamlit secrets"""
     return os.getenv("OPENROUTER_API_KEY") or st.secrets.get("OPENROUTER_API_KEY")
-
+    
 def chunk_text(text, max_chars=3000):
     """Split long texts into chunks for summarization"""
     return [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
 
-def analyze_text_with_ai(text, task="summarize and extract insights"):
-    """Send text to OpenRouter API and get AI analysis"""
-    API_KEY = get_api_key()
-    if not API_KEY:
-        return "❌ No API key found. Please set OPENROUTER_API_KEY."
+def analyze_with_ai(text: str):
+    """
+    Sends article text to the OpenRouter API and extracts summary, insights, and keywords.
+    Always returns 3 values (summary, insights, keywords).
+    """
+    import os, requests, json
+    api_key = get_api_key()
+    if not api_key:
+        return "❌ API key missing. Please set OPENROUTER_API_KEY.", "", []
 
-    chunks = chunk_text(text)
-    results = []
+    prompt = f"""
+    Please analyze the following biomedical research text. 
+    1. Provide a **concise summary** (3-5 sentences).  
+    2. Extract **key insights or findings** useful for a bioengineer.  
+    3. List the **most relevant keywords**.  
 
-    for idx, chunk in enumerate(chunks, start=1):
-        with st.spinner(f"Summarizing chunk {idx}/{len(chunks)}..."):
-            prompt = f"""
-            You are a biomedical research assistant.
-            Task: {task}.
-            Text:
-            {chunk}
+    Text:
+    {text[:4000]}  # limit to avoid token overflow
+    """
 
-            Please provide:
-            - Concise summary
-            - Key insights
-            - Keywords (max 10)
-            """
+    try:
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            data=json.dumps({
+                "model": "deepseek/deepseek-r1:free",
+                "messages": [{"role": "user", "content": prompt}],
+            }),
+            timeout=60,
+        )
 
-            response = requests.post(
-                url="https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                data=json.dumps({
-                    "model": "deepseek/deepseek-r1:free",
-                    "messages": [{"role": "user", "content": prompt}]
-                })
-            )
+        if response.status_code != 200:
+            return f"❌ API error: {response.text}", "", []
 
-            if response.status_code == 200:
-                result = response.json()
-                results.append(result["choices"][0]["message"]["content"])
-            else:
-                results.append(f"⚠️ Error {response.status_code}: {response.text}")
+        content = response.json()["choices"][0]["message"]["content"]
 
-    return "\n\n---\n\n".join(results)
+        # crude parsing
+        summary = content.split("Key Insights:")[0].strip()
+        insights = ""
+        keywords = []
+
+        if "Key Insights:" in content:
+            parts = content.split("Key Insights:")
+            summary = parts[0].strip()
+            insights_section = parts[1].split("Keywords:")[0].strip() if "Keywords:" in parts[1] else parts[1].strip()
+            insights = insights_section
+            if "Keywords:" in parts[1]:
+                keywords = [k.strip() for k in parts[1].split("Keywords:")[1].split(",")]
+
+        return summary, insights, keywords
+
+    except Exception as e:
+        return f"❌ Exception: {str(e)}", "", []
+
 
 # -------------------------
 # Caching wrappers
