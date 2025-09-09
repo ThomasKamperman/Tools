@@ -1,4 +1,5 @@
 # app.py
+# Improved Bioengineer Research Assistant
 # - Bug fixes (clipboard, placeholders, duplicates)
 # - Pagination for article results
 # - Export workspace to ZIP (JSON + FASTA)
@@ -61,6 +62,60 @@ def ncbi_request(path: str, params: dict, timeout: int = 20) -> requests.Respons
     resp = requests.get(BASE_URL + path, params=p, timeout=timeout)
     resp.raise_for_status()
     return resp
+
+# -----------------------
+# AI Summarization Utils
+# -----------------------
+def get_api_key():
+    """Fetch API key from env or Streamlit secrets"""
+    return os.getenv("OPENROUTER_API_KEY") or st.secrets.get("OPENROUTER_API_KEY")
+
+def chunk_text(text, max_chars=3000):
+    """Split long texts into chunks for summarization"""
+    return [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
+
+def analyze_text_with_ai(text, task="summarize and extract insights"):
+    """Send text to OpenRouter API and get AI analysis"""
+    API_KEY = get_api_key()
+    if not API_KEY:
+        return "❌ No API key found. Please set OPENROUTER_API_KEY."
+
+    chunks = chunk_text(text)
+    results = []
+
+    for idx, chunk in enumerate(chunks, start=1):
+        with st.spinner(f"Summarizing chunk {idx}/{len(chunks)}..."):
+            prompt = f"""
+            You are a biomedical research assistant.
+            Task: {task}.
+            Text:
+            {chunk}
+
+            Please provide:
+            - Concise summary
+            - Key insights
+            - Keywords (max 10)
+            """
+
+            response = requests.post(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                data=json.dumps({
+                    "model": "deepseek/deepseek-r1:free",
+                    "messages": [{"role": "user", "content": prompt}]
+                })
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                results.append(result["choices"][0]["message"]["content"])
+            else:
+                results.append(f"⚠️ Error {response.status_code}: {response.text}")
+
+    return "\n\n---\n\n".join(results)
 
 # -------------------------
 # Caching wrappers
@@ -401,7 +456,7 @@ st.sidebar.text_input("NCBI API key (optional)", key="ncbi_api_key")
 section = st.sidebar.radio("Section", ["Articles", "Sequences", "Molecules", "Protein 3D", "Workspace", "Network"])
 
 # -------------------------
-# Articles tab (with pagination)
+# Articles tab (revamped with AI features)
 # -------------------------
 if section == "Articles":
     st.sidebar.header("Article search")
@@ -411,20 +466,22 @@ if section == "Articles":
     year_from, year_to = st.sidebar.slider("Year range", 1990, 2026, (2000, 2025))
     organ_terms = st.sidebar.text_input("Highlight keywords (comma-separated)", value="pancreas, insulin, islet")
     highlight_list = [t.strip() for t in organ_terms.split(",") if t.strip()]
+
     # pagination state
     if "articles_page" not in st.session_state:
         st.session_state.articles_page = 0
     per_page = st.sidebar.number_input("Results per page (UI)", min_value=1, max_value=10, value=3)
+
     if st.sidebar.button("Search"):
         st.session_state.articles_page = 0
-        with st.spinner("Searching PubMed and PMC..."):
+        with st.spinner("🔎 Searching PubMed and PMC..."):
             pmids = search_ids(query, db="pubmed", max_results=max_results)
             pmcs = search_ids(query, db="pmc", max_results=max_results)
             results_display = []
+
             # PubMed
             for pmid in pmids:
                 res = fetch_pubmed(pmid, abstract_max_len=2000)
-                # filter by year
                 try:
                     y = int(res.get("year")) if res.get("year") else None
                 except:
@@ -433,79 +490,92 @@ if section == "Articles":
                     continue
                 res["db"] = "pubmed"
                 results_display.append(res)
+
             # PMC
             for pid in pmcs:
                 res = fetch_pmc(pid, full_article=full_article_toggle, abstract_max_len=2000)
                 res["db"] = "pmc"
                 results_display.append(res)
+
             st.session_state._last_search_results = results_display
-    # show results from last search
+
+    # show results
     results_display = st.session_state.get("_last_search_results", [])
     total = len(results_display)
+
     if total == 0:
-        st.info("No results yet — run a search.")
+        st.info("ℹ️ No results yet — run a search.")
     else:
         page = st.session_state.articles_page
         start = page * per_page
         end = min(total, start + per_page)
-        st.markdown(f"Showing results {start+1} — {end} of {total}")
+        st.markdown(f"**📄 Showing results {start+1} — {end} of {total}**")
+
         for r in results_display[start:end]:
             title = r.get("title") or r.get("id")
             year = r.get("year") or ""
             journal = r.get("journal") or ""
-            with st.expander(f"{title} {f'({year})' if year else ''}", expanded=False):
+            db = r.get("db")
+
+            with st.expander(f"**{title}** ({year})", expanded=False):
                 if journal:
-                    st.markdown(f"**Journal:** {journal}")
-                if r.get("db") == "pmc":
-                    # generate PMC link
+                    st.caption(f"📚 *{journal}*")
+
+                # Links
+                if db == "pmc":
                     pid = r.get("id")
-                    # fix id formatting: PMC id sometimes returned without 'PMC' prefix
                     if str(pid).lower().startswith("pmc"):
                         url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pid}"
                     else:
                         url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pid}"
-                    st.markdown(f"[Open in PMC]({url})")
-                if r.get("db") == "pubmed":
-                    st.markdown(f"[Open in PubMed](https://pubmed.ncbi.nlm.nih.gov/{r.get('id')})")
-                # show text
-                if r.get("full_text"):
-                    html = highlight_terms(r.get("full_text"), highlight_list)
-                    st.markdown("**Full text (PMC)**")
+                    st.markdown(f"[🔗 Open in PMC]({url})")
+                elif db == "pubmed":
+                    st.markdown(f"[🔗 Open in PubMed](https://pubmed.ncbi.nlm.nih.gov/{r.get('id')})")
+
+                # Show abstract/full text
+                text_to_show = r.get("full_text") or r.get("abstract") or r.get("preview")
+                if text_to_show:
+                    html = highlight_terms(text_to_show, highlight_list)
+                    st.markdown("**Article content:**")
                     st.markdown(html, unsafe_allow_html=True)
-                    st.download_button("Download full text", data=r.get("full_text",""), file_name=f"{r.get('id')}_fulltext.txt")
-                elif r.get("abstract"):
-                    html = highlight_terms(r.get("abstract"), highlight_list)
-                    st.markdown("**Abstract**")
-                    st.markdown(html, unsafe_allow_html=True)
-                elif r.get("preview"):
-                    html = highlight_terms(r.get("preview"), highlight_list)
-                    st.markdown("**Preview**")
-                    st.markdown(html, unsafe_allow_html=True)
+                    st.download_button("⬇️ Download text", data=text_to_show, file_name=f"{r.get('id')}.txt")
                 else:
-                    st.write("No text available")
-                # actions: save, export, copy citation
+                    st.warning("No text available.")
+
+                # --- AI Analysis ---
+                if st.button("🤖 Summarize & Extract Insights", key=f"summarize_{db}_{r.get('id')}"):
+                    with st.spinner("AI is analyzing the text..."):
+                        summary, insights, keywords = analyze_with_ai(text_to_show)
+                        st.subheader("🔑 Summary")
+                        st.write(summary)
+                        st.subheader("💡 Key Insights")
+                        st.write(insights)
+                        st.subheader("🧬 Keywords")
+                        st.write(", ".join(keywords))
+
+                # Actions row
                 cols = st.columns([1,1,1,3])
-                # Save to workspace (deduped)
-                if cols[0].button("Save", key=f"save_article_{r.get('db')}_{r.get('id')}"):
-                    uid = f"{r.get('db')}:{r.get('id')}"
+                if cols[0].button("Save", key=f"save_article_{db}_{r.get('id')}"):
+                    uid = f"{db}:{r.get('id')}"
                     if uid not in st.session_state._article_ids:
                         st.session_state.articles.append(r)
                         st.session_state._article_ids.add(uid)
-                        st.success("Saved")
+                        st.success("✅ Saved")
                     else:
                         st.info("Already saved")
-                # Export JSON
-                if cols[1].button("Export JSON", key=f"export_article_{r.get('db')}_{r.get('id')}"):
+
+                if cols[1].button("Export JSON", key=f"export_article_{db}_{r.get('id')}"):
                     st.download_button("Download JSON", data=json.dumps(r, indent=2).encode("utf-8"), file_name=f"{r.get('id')}.json", mime="application/json")
-                # Copy citation via JS
-                if cols[2].button("Copy citation", key=f"cite_article_{r.get('db')}_{r.get('id')}"):
+
+                if cols[2].button("Copy citation", key=f"cite_article_{db}_{r.get('id')}"):
                     citation = f"{r.get('title')} ({r.get('year')}) {r.get('journal')}"
                     js_copy_button(citation, key=f"cite_{r.get('id')}")
-        # pagination controls
+
+        # Pagination
         page_cols = st.columns([1,1,6])
-        if page_cols[0].button("Previous") and st.session_state.articles_page > 0:
+        if page_cols[0].button("⬅️ Previous") and st.session_state.articles_page > 0:
             st.session_state.articles_page -= 1
-        if page_cols[1].button("Next") and (st.session_state.articles_page+1)*per_page < total:
+        if page_cols[1].button("Next ➡️") and (st.session_state.articles_page+1)*per_page < total:
             st.session_state.articles_page += 1
 
 # -------------------------
